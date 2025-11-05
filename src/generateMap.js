@@ -119,59 +119,74 @@ export class GenerateMap {
     });
 
     if (regionPolygons.length > 0) {
-      this.generateCountries(regionPolygons, centerPoint, scale * 0.6);
+      this.generateCountries(regionPolygons, 3); // 這裡的 3 改成你想要的數量
     }
   }
 
-  generateCountries(regionPolygons, regionCenter, scale) {
-    // 生成三個國家中心（在區域重心附近）
+  generateCountries(regionPolygons, numCountries = 3, minTiles = 10) {
     const [rcx, rcy] = d3.polygonCentroid(_.flatten(regionPolygons));
-    const centers = _.range(3).map(() => ({
-      x: rcx + _.random(-50, 50),
-      y: rcy + _.random(-50, 50),
+  
+    // 初步生成中心點
+    let centers = _.range(numCountries).map(() => ({
+      x: rcx + _.random(-80, 80),
+      y: rcy + _.random(-80, 80),
     }));
-
-    // 每個國家一個格子集合
-    const countries = [[], [], []];
-
+  
+    let countries = Array.from({ length: numCountries }, () => []);
+  
+    // 初步分配
     regionPolygons.forEach((polygon) => {
       const [cx, cy] = d3.polygonCentroid(polygon);
-      let minDist = Infinity;
-      let idx = 0;
+      let minDist = Infinity, idx = 0;
       centers.forEach((c, i) => {
         const d = (cx - c.x) ** 2 + (cy - c.y) ** 2;
-        if (d < minDist) {
-          minDist = d;
-          idx = i;
-        }
+        if (d < minDist) { minDist = d; idx = i; }
       });
       countries[idx].push(polygon);
     });
-
-    // 畫每個國家的邊界（紅色）
-    countries.forEach((polys) => {
+  
+    // 檢查是否有國家太小
+    let validCountries = [];
+    let orphanPolygons = [];
+    countries.forEach((tiles) => {
+      if (tiles.length >= minTiles) {
+        validCountries.push(tiles);
+      } else {
+        orphanPolygons.push(...tiles);
+      }
+    });
+  
+    // 如果有效國家數量不足 → 強制補到 numCountries
+    while (validCountries.length < numCountries) {
+      validCountries.push([]); // 建立空國家，稍後分配孤格
+    }
+  
+    // 把孤格重新分配給最近的有效國家
+    orphanPolygons.forEach((polygon) => {
+      const [cx, cy] = d3.polygonCentroid(polygon);
+      let minDist = Infinity, idx = 0;
+      validCountries.forEach((tiles, i) => {
+        if (tiles.length === 0) { idx = i; return; } // 空國家直接拿
+        const [tx, ty] = d3.polygonCentroid(_.flatten(tiles));
+        const d = (cx - tx) ** 2 + (cy - ty) ** 2;
+        if (d < minDist) { minDist = d; idx = i; }
+      });
+      validCountries[idx].push(polygon);
+    });
+  
+    // 畫國界：照子格子邊界描
+    validCountries.forEach((polys) => {
       if (polys.length === 0) return;
-
-      // 建立一個集合，記錄每條邊是否已經被另一個格子用過
       const edgeMap = new Map();
-
       polys.forEach((poly) => {
         for (let i = 0; i < poly.length; i++) {
-          const a = poly[i];
-          const b = poly[(i + 1) % poly.length];
+          const a = poly[i], b = poly[(i + 1) % poly.length];
           const key1 = `${a[0]},${a[1]}-${b[0]},${b[1]}`;
           const key2 = `${b[0]},${b[1]}-${a[0]},${a[1]}`;
-
-          if (edgeMap.has(key2)) {
-            // 這條邊已經被另一個格子用過 → 內部邊，不畫
-            edgeMap.delete(key2);
-          } else {
-            edgeMap.set(key1, [a, b]);
-          }
+          if (edgeMap.has(key2)) edgeMap.delete(key2);
+          else edgeMap.set(key1, [a, b]);
         }
       });
-
-      // 畫剩下的邊（就是國界）
       this.ctx.strokeStyle = "red";
       this.ctx.lineWidth = 2;
       edgeMap.forEach(([a, b]) => {
