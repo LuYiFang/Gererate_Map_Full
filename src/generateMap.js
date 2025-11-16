@@ -59,8 +59,7 @@ export class GenerateMap {
     // 2) 生成大陸格子
     this.drawOcean();
     const mainland = this.buildMainland(this.oceanPolygon);
-    const totalTiles = mainland.length;
-    if (totalTiles === 0) return;
+    if (mainland.length === 0) return;
 
     // 3) 分配區域（固定數量 + 最小格數 + 連通性）
     const regions = this.forceAssignWithConnectivity(
@@ -71,7 +70,6 @@ export class GenerateMap {
 
     // 4) 畫區域 & 切國家
     regions.forEach((regionPolys, i) => {
-      // 畫區域
       this.ctx.fillStyle = colors[i % colors.length];
       regionPolys.forEach((poly) => this.drawPloygon(poly));
 
@@ -81,11 +79,10 @@ export class GenerateMap {
         countriesPerRegion,
         minTilesCountry
       );
-
-      // 畫國界
       countries.forEach((polys) => this.drawBorders(polys, "red", 2));
     });
   }
+
   // Base Voronoi cells over the canvas
   drawOcean() {
     const p = new PoissonDiskSampling({
@@ -341,7 +338,9 @@ export class GenerateMap {
   }
 
   forceAssignWithConnectivity(polygons, numGroups, minTiles) {
-    // 初步分配
+    let orphans = [];
+
+    // 1. 初步分配
     let centers = this.generateCentersInPolygons(numGroups, polygons);
     let groups = Array.from({ length: numGroups }, () => []);
     polygons.forEach((poly) => {
@@ -358,22 +357,29 @@ export class GenerateMap {
       groups[idx].push(poly);
     });
 
-    // 檢查連通性：拆成連通分量
-    const connectedGroups = [];
+    // 2. 拆分連通分量，保留最大塊，其他丟到孤格池
+    let connectedGroups = [];
     groups.forEach((g) => {
       const comps = this.splitConnectedComponents(g);
-      connectedGroups.push(...comps);
+      if (comps.length > 0) {
+        const largest = _.maxBy(comps, (c) => c.length);
+        connectedGroups.push(largest);
+        comps.forEach((c) => {
+          if (c !== largest) {
+            c.forEach((poly) => orphans.push(poly));
+          }
+        });
+      }
     });
 
-    // 合併太小的分量
+    // 3. 合併太小的分量
     const validGroups = [];
-    const orphans = [];
     connectedGroups.forEach((g) => {
       if (g.length >= minTiles) validGroups.push(g);
-      else orphans.push(...g);
+      else g.forEach((poly) => orphans.push(poly));
     });
 
-    // 把孤格合併到最近的大國
+    // 4. 把孤格合併到最近的大塊
     orphans.forEach((poly) => {
       const [cx, cy] = d3.polygonCentroid(poly);
       let minDist = Infinity,
@@ -389,7 +395,7 @@ export class GenerateMap {
       validGroups[idx].push(poly);
     });
 
-    // 如果數量不足 → 從最大 group 拆分
+    // 5. 如果數量不足 → 從最大 group 拆分
     while (validGroups.length < numGroups) {
       const largestIdx = _.maxBy(
         _.range(validGroups.length),
@@ -405,14 +411,13 @@ export class GenerateMap {
     return validGroups;
   }
 
+  // 拆分連通分量：保證同一區域/國家是一整塊
   splitConnectedComponents(polys) {
     if (!polys || polys.length === 0) return [];
 
-    // 建立 adjacency map
     const adj = new Map();
     polys.forEach((_, idx) => adj.set(idx, new Set()));
 
-    // 建立邊索引
     const edgeMap = new Map();
     const key = (a, b) => `${a[0]},${a[1]}-${b[0]},${b[1]}`;
     const rev = (a, b) => `${b[0]},${b[1]}-${a[0]},${a[1]}`;
@@ -433,7 +438,6 @@ export class GenerateMap {
       }
     });
 
-    // BFS 拆分成連通分量
     const visited = new Array(polys.length).fill(false);
     const components = [];
 
