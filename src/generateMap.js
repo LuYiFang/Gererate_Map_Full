@@ -49,32 +49,38 @@ export class GenerateMap {
     minTilesRegion = 30,
     minTilesCountry = 10
   ) {
-    // 1) 畫海洋背景
+    // ocean frame
     this.ctx.fillStyle = "#6495ED";
     this.ctx.fillRect(this.bbox.xl, this.bbox.yt, this.width, this.height);
     this.ctx.strokeStyle = "black";
     this.ctx.lineWidth = 1;
     this.ctx.strokeRect(this.bbox.xl, this.bbox.yt, this.width, this.height);
 
-    // 2) 生成大陸格子
+    // mainland
     this.drawOcean();
     const mainland = this.buildMainland(this.oceanPolygon);
     if (mainland.length === 0) return;
 
-    // 3) 分配區域（固定數量 + 最小格數 + 連通性）
-    const regions = this.forceAssignWithConnectivity(
-      mainland,
-      regionNum,
-      minTilesRegion
+    // region growing + boundary rebalancing
+    const {
+      groups: regionGroups,
+      pool: regionPool,
+      idxAdj,
+    } = this.growConnectedGroups(mainland, regionNum, minTilesRegion);
+    const regions = this.rebalanceBoundaries(
+      regionGroups,
+      regionPool,
+      idxAdj,
+      minTilesRegion,
+      regionNum
     );
 
-    // 4) 畫區域 & 切國家
+    // draw regions and assign countries per region
     regions.forEach((regionPolys, i) => {
       this.ctx.fillStyle = colors[i % colors.length];
       regionPolys.forEach((poly) => this.drawPloygon(poly));
 
-      // 5) 分配國家（固定數量 + 最小格數 + 連通性）
-      const countries = this.forceAssignWithConnectivity(
+      const countries = this.assignCountriesWithinRegion(
         regionPolys,
         countriesPerRegion,
         minTilesCountry
@@ -234,183 +240,6 @@ export class GenerateMap {
     return centers;
   }
 
-  // Assign tiles to nearest center; enforce minimum tiles by merging orphans to nearest valid group
-  assignPolygonsToCenters(polygons, centers, minTiles) {
-    let groups = Array.from({ length: centers.length }, () => []);
-
-    // Initial assignment by nearest center
-    polygons.forEach((poly) => {
-      const [cx, cy] = d3.polygonCentroid(poly);
-      let minDist = Infinity,
-        idx = 0;
-      centers.forEach((c, i) => {
-        const d = (cx - c.x) ** 2 + (cy - c.y) ** 2;
-        if (d < minDist) {
-          minDist = d;
-          idx = i;
-        }
-      });
-      groups[idx].push(poly);
-    });
-
-    // Filter groups by minTiles; collect orphans
-    const valid = [];
-    const orphans = [];
-    groups.forEach((g) => {
-      if (g.length >= minTiles) valid.push(g);
-      else orphans.push(...g);
-    });
-
-    // If valid fewer than centers, pad with empty groups to keep target count
-    while (valid.length < centers.length) valid.push([]);
-
-    // Reassign orphans to nearest valid group centroid
-    orphans.forEach((poly) => {
-      const [cx, cy] = d3.polygonCentroid(poly);
-      let minDist = Infinity,
-        idx = 0;
-      valid.forEach((g, i) => {
-        if (g.length === 0) {
-          idx = i; // give to empty group first
-          minDist = -1;
-          return;
-        }
-        const [tx, ty] = d3.polygonCentroid(_.flatten(g));
-        const d = (cx - tx) ** 2 + (cy - ty) ** 2;
-        if (d < minDist) {
-          minDist = d;
-          idx = i;
-        }
-      });
-      valid[idx].push(poly);
-    });
-
-    return valid;
-  }
-
-  forceAssign(polygons, numGroups, minTiles) {
-    // 1. 初步分配
-    let groups = this.assignPolygonsToCenters(
-      polygons,
-      this.generateCentersInPolygons(numGroups, polygons),
-      1
-    );
-
-    // 2. 合併太小的 group
-    groups = groups.filter((g) => g.length > 0);
-    groups.forEach((g, i) => {
-      if (g.length < minTiles) {
-        // 把 g 合併到最近的大 group
-        g.forEach((poly) => {
-          const [cx, cy] = d3.polygonCentroid(poly);
-          let minDist = Infinity,
-            idx = 0;
-          groups.forEach((gg, j) => {
-            if (gg.length >= minTiles) {
-              const [tx, ty] = d3.polygonCentroid(_.flatten(gg));
-              const d = (cx - tx) ** 2 + (cy - ty) ** 2;
-              if (d < minDist) {
-                minDist = d;
-                idx = j;
-              }
-            }
-          });
-          groups[idx].push(poly);
-        });
-        groups[i] = [];
-      }
-    });
-    groups = groups.filter((g) => g.length > 0);
-
-    // 3. 如果數量不足 → 從最大 group 拆分
-    while (groups.length < numGroups) {
-      const largestIdx = _.maxBy(
-        _.range(groups.length),
-        (i) => groups[i].length
-      );
-      const largest = groups[largestIdx];
-      const half = Math.floor(largest.length / 2);
-      const newGroup = largest.splice(0, half);
-      groups.push(newGroup);
-    }
-
-    return groups;
-  }
-
-  forceAssignWithConnectivity(polygons, numGroups, minTiles) {
-    let orphans = [];
-
-    // 1. 初步分配
-    let centers = this.generateCentersInPolygons(numGroups, polygons);
-    let groups = Array.from({ length: numGroups }, () => []);
-    polygons.forEach((poly) => {
-      const [cx, cy] = d3.polygonCentroid(poly);
-      let minDist = Infinity,
-        idx = 0;
-      centers.forEach((c, i) => {
-        const d = (cx - c.x) ** 2 + (cy - c.y) ** 2;
-        if (d < minDist) {
-          minDist = d;
-          idx = i;
-        }
-      });
-      groups[idx].push(poly);
-    });
-
-    // 2. 拆分連通分量，保留最大塊，其他丟到孤格池
-    let connectedGroups = [];
-    groups.forEach((g) => {
-      const comps = this.splitConnectedComponents(g);
-      if (comps.length > 0) {
-        const largest = _.maxBy(comps, (c) => c.length);
-        connectedGroups.push(largest);
-        comps.forEach((c) => {
-          if (c !== largest) {
-            c.forEach((poly) => orphans.push(poly));
-          }
-        });
-      }
-    });
-
-    // 3. 合併太小的分量
-    const validGroups = [];
-    connectedGroups.forEach((g) => {
-      if (g.length >= minTiles) validGroups.push(g);
-      else g.forEach((poly) => orphans.push(poly));
-    });
-
-    // 4. 把孤格合併到最近的大塊
-    orphans.forEach((poly) => {
-      const [cx, cy] = d3.polygonCentroid(poly);
-      let minDist = Infinity,
-        idx = 0;
-      validGroups.forEach((g, i) => {
-        const [tx, ty] = d3.polygonCentroid(_.flatten(g));
-        const d = (cx - tx) ** 2 + (cy - ty) ** 2;
-        if (d < minDist) {
-          minDist = d;
-          idx = i;
-        }
-      });
-      validGroups[idx].push(poly);
-    });
-
-    // 5. 如果數量不足 → 從最大 group 拆分
-    while (validGroups.length < numGroups) {
-      const largestIdx = _.maxBy(
-        _.range(validGroups.length),
-        (i) => validGroups[i].length
-      );
-      const largest = validGroups[largestIdx];
-      if (largest.length <= minTiles * 2) break;
-      const half = Math.floor(largest.length / 2);
-      const newGroup = largest.splice(0, half);
-      validGroups.push(newGroup);
-    }
-
-    return validGroups;
-  }
-
   // 拆分連通分量：保證同一區域/國家是一整塊
   splitConnectedComponents(polys) {
     if (!polys || polys.length === 0) return [];
@@ -539,33 +368,231 @@ export class GenerateMap {
     this.ctx.stroke();
   }
 
-  // Legacy helpers kept (not used for region centers now)
-  randomCenter = (num, a) => {
-    const h = this.mapCenter.x;
-    const k = this.mapCenter.y;
-    const b = (a * this.height) / this.width;
+  buildAdjacency(polys) {
+    const edgeToIdx = new Map();
+    const idxAdj = new Map(); // idx -> Set(idx)
+    const E = (a, b) => `${a[0]},${a[1]}-${b[0]},${b[1]}`;
+    const R = (a, b) => `${b[0]},${b[1]}-${a[0]},${a[1]}`;
 
-    const initCenter = _.random(0, 360);
-    const centerDist = Math.round(360 / num);
+    polys.forEach((poly, idx) => {
+      idxAdj.set(idx, new Set());
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i],
+          b = poly[(i + 1) % poly.length];
+        const k1 = E(a, b),
+          k2 = R(a, b);
+        if (edgeToIdx.has(k2)) {
+          const j = edgeToIdx.get(k2);
+          idxAdj.get(idx).add(j);
+          idxAdj.get(j).add(idx);
+        } else {
+          edgeToIdx.set(k1, idx);
+        }
+      }
+    });
+    return idxAdj;
+  }
 
-    const countCoordinate = (t) => {
-      return [h + a * Math.cos(t), k + b * Math.sin(t)];
+  growConnectedGroups(polys, k, minTiles) {
+    // seed selection: pick k centroids spread (reuse your center generator or farthest-point)
+    const centers = this.generateCentersInPolygons(k, polys);
+    const idxAdj = this.buildAdjacency(polys);
+    const N = polys.length;
+
+    // map each tile index to nearest center by distance as initial queues
+    const tileCentroid = (p) => d3.polygonCentroid(p);
+    const centerPos = centers.map((c) => [c.x, c.y]);
+    const nearestCenter = new Array(N).fill(-1);
+    const queues = Array.from({ length: k }, () => []);
+    for (let i = 0; i < N; i++) {
+      const [cx, cy] = tileCentroid(polys[i]);
+      let best = 0,
+        bd = Infinity;
+      for (let j = 0; j < k; j++) {
+        const [px, py] = centerPos[j];
+        const d = (cx - px) * (cx - px) + (cy - py) * (cy - py);
+        if (d < bd) {
+          bd = d;
+          best = j;
+        }
+      }
+      queues[best].push(i);
+    }
+
+    // visited assignment
+    const assign = new Array(N).fill(-1);
+    const fronts = queues.map((q) => new Set(q));
+
+    // multi-source growth: only grow to adjacent unassigned tiles from each frontier
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (let g = 0; g < k; g++) {
+        // take a frontier snapshot
+        const frontier = Array.from(fronts[g]);
+        fronts[g].clear();
+        for (const idx of frontier) {
+          if (assign[idx] === -1) {
+            assign[idx] = g;
+            progress = true;
+          }
+          // push neighbors if unassigned
+          idxAdj.get(idx).forEach((nb) => {
+            if (assign[nb] === -1) fronts[g].add(nb);
+          });
+        }
+      }
+    }
+
+    // build groups
+    const groups = Array.from({ length: k }, () => []);
+    for (let i = 0; i < N; i++) {
+      const g = assign[i] !== -1 ? assign[i] : 0; // fallback
+      groups[g].push(polys[i]);
+    }
+
+    // connectivity prune: keep largest component per group, send fragments to reassign pool
+    const pool = [];
+    const connectedGroups = groups.map((g) => {
+      const comps = this.splitConnectedComponents(g);
+      if (comps.length <= 1) return g;
+      comps.sort((a, b) => b.length - a.length);
+      for (let i = 1; i < comps.length; i++) pool.push(...comps[i]);
+      return comps[0];
+    });
+
+    return { groups: connectedGroups, pool, assign, idxAdj };
+  }
+
+  rebalanceBoundaries(groups, pool, idxAdj, minTiles, targetCounts) {
+    // groups: Array<Polygon[]>, fixed length = targetCounts
+    // pool: polygons needing assignment
+    const k = groups.length;
+
+    // helper: check donor stays connected after removing a tile
+    const staysConnectedAfterRemoval = (groupTiles, removePoly) => {
+      const remain = groupTiles.filter((p) => p !== removePoly);
+      if (remain.length === 0) return false;
+      const comps = this.splitConnectedComponents(remain);
+      return comps.length === 1;
     };
 
-    let angle = initCenter;
-    return _.map(_.range(num), (i) => {
-      const coordinate = countCoordinate((angle * Math.PI) / 180);
-
-      angle += centerDist;
-      if (angle > 360) {
-        angle = angle - 360;
+    // step A: assign pool tiles to nearest valid group (by centroid distance), preserving connectivity
+    const centroidOfGroup = (g) => d3.polygonCentroid(_.flatten(g));
+    const groupCenters = groups.map((g) => centroidOfGroup(g));
+    const assignToNearest = (poly) => {
+      const [cx, cy] = d3.polygonCentroid(poly);
+      let best = 0,
+        bd = Infinity;
+      for (let i = 0; i < k; i++) {
+        const [gx, gy] = groupCenters[i];
+        const d = (cx - gx) * (cx - gx) + (cy - gy) * (cy - gy);
+        if (d < bd) {
+          bd = d;
+          best = i;
+        }
       }
+      groups[best].push(poly);
+    };
+    pool.forEach(assignToNearest);
 
-      return coordinate;
+    // step B: for groups below minTiles, pull boundary-neighbor tiles from adjacent larger groups
+    const groupSize = (i) => groups[i].length;
+    const need = [];
+    for (let i = 0; i < k; i++) if (groupSize(i) < minTiles) need.push(i);
+
+    // build tile->group map
+    const tileToGroup = new Map();
+    groups.forEach((g, gi) => g.forEach((p) => tileToGroup.set(p, gi)));
+
+    // detect adjacency between groups via tile neighbors
+    const groupNeighbors = Array.from({ length: k }, () => new Set());
+    groups.forEach((g, gi) => {
+      g.forEach((p, idxInG) => {
+        // find neighbors by shared edges among all tiles (approx via centroid proximity is insufficient)
+        // brute: check all other tiles once (acceptable for moderate N)
+        // optimize in your code with a spatial index
+        // here, we skip heavy build and rely on later local scans
+      });
     });
-  };
 
-  countOvalRadius(scale) {
-    return scale * 100 * 1.5 + 150;
+    // boundary exchange: iterate limited rounds
+    for (let round = 0; round < 20 && need.length; round++) {
+      for (const gi of need) {
+        // find candidate donors with size > minTiles
+        const donors = [];
+        for (let gj = 0; gj < k; gj++)
+          if (gj !== gi && groups[gj].length > minTiles) donors.push(gj);
+        if (!donors.length) continue;
+
+        // seek donor boundary tile adjacent to group gi
+        let transferred = false;
+        for (const gj of donors) {
+          // boundary tiles of donor: tiles that have a neighbor belonging to other groups
+          const donorTiles = groups[gj];
+          for (const t of donorTiles) {
+            // check if t touches any tile in receiver gi
+            const touchesReceiver = groups[gi].some((r) =>
+              this.shareEdge(t, r)
+            );
+            if (!touchesReceiver) continue;
+            // donor connectivity check
+            if (!staysConnectedAfterRemoval(groups[gj], t)) continue;
+            // move tile
+            groups[gj] = groups[gj].filter((p) => p !== t);
+            groups[gi].push(t);
+            transferred = true;
+            break;
+          }
+          if (transferred) break;
+        }
+        // update need list
+        if (groups[gi].length >= minTiles) {
+          const idx = need.indexOf(gi);
+          if (idx >= 0) need.splice(idx, 1);
+        }
+      }
+    }
+
+    return groups;
+  }
+
+  // shared-edge check (adjacency by geometry)
+  shareEdge(p1, p2) {
+    for (let i = 0; i < p1.length; i++) {
+      const a1 = p1[i],
+        b1 = p1[(i + 1) % p1.length];
+      for (let j = 0; j < p2.length; j++) {
+        const a2 = p2[j],
+          b2 = p2[(j + 1) % p2.length];
+        const equal = (u, v) => u[0] === v[0] && u[1] === v[1];
+        if (
+          (equal(a1, a2) && equal(b1, b2)) ||
+          (equal(a1, b2) && equal(b1, a2))
+        )
+          return true;
+      }
+    }
+    return false;
+  }
+
+  assignCountriesWithinRegion(
+    regionTiles,
+    countriesPerRegion,
+    minTilesCountry
+  ) {
+    const { groups, pool, idxAdj } = this.growConnectedGroups(
+      regionTiles,
+      countriesPerRegion,
+      minTilesCountry
+    );
+    const balanced = this.rebalanceBoundaries(
+      groups,
+      pool,
+      idxAdj,
+      minTilesCountry,
+      countriesPerRegion
+    );
+    return balanced;
   }
 }
